@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  igbot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "bot.py"]

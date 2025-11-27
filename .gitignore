@@ -1,0 +1,19 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+*.venv/
+
+# Environment / secrets
+.env
+.env.*
+
+# Local data and history
+data/history/
+data/session.json
+data/state.json
+data/stats.json
+data/history.json
