@@ -4,9 +4,10 @@ import os
 import random
 import re
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -23,7 +24,10 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 SESSION_FILE = DATA_DIR / "session.json"
 STATE_FILE = DATA_DIR / "state.json"
 HISTORY_DIR = DATA_DIR / "history"
+SUMMARY_DIR = DATA_DIR / "summary"
 SYSTEM_PROMPT_FILE = PROMPTS_DIR / "system_prompt.txt"
+SUMMARY_BATCH_SIZE = 50
+MAX_HISTORY_KEEP = 1000
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个 Instagram 群聊里的成员，昵称叫 QwenBot。\n"
@@ -38,7 +42,63 @@ logging.basicConfig(
 )
 
 
-def load_state() -> Dict[str, Dict[str, str]]:
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Best-effort int conversion with fallback."""
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def ensure_history_entry_defaults(entry: Dict[str, Any]) -> None:
+    """
+    Backfill newly added history fields for兼容旧记录。
+    """
+    if entry is None:
+        return
+    if entry.get("id") is not None:
+        entry["id"] = str(entry.get("id"))
+    entry.setdefault("timestamp", "")
+    entry.setdefault("user_id", None)
+    entry.setdefault("username", None)
+    entry.setdefault("item_type", "text")
+    entry.setdefault("text", entry.get("text") or "")
+    entry.setdefault("caption", None)
+    entry.setdefault("media_type", None)
+
+    # URL 字段兜底：确保为 str 或 None
+    media_url = entry.get("media_url")
+    if media_url is not None and not isinstance(media_url, str):
+        try:
+            entry["media_url"] = str(media_url)
+        except Exception:
+            entry["media_url"] = None
+
+    link_url = entry.get("link_url")
+    if link_url is not None and not isinstance(link_url, str):
+        try:
+            entry["link_url"] = str(link_url)
+        except Exception:
+            entry["link_url"] = None
+
+    link_meta = entry.get("link_meta")
+    if isinstance(link_meta, dict):
+        for k, v in list(link_meta.items()):
+            if v is not None and not isinstance(v, str):
+                try:
+                    link_meta[k] = str(v)
+                except Exception:
+                    link_meta[k] = None
+
+    entry.setdefault("media_url", None)
+    entry.setdefault("media_vl_summary", None)
+    entry.setdefault("media_vl_tags", None)
+    entry.setdefault("link_url", None)
+    entry.setdefault("link_meta", entry.get("link_meta"))
+    entry.setdefault("reply_to", entry.get("reply_to"))
+
+
+def load_state() -> Dict[str, Dict[str, Any]]:
     """
     从 state.json 读出每个 thread 的状态（兼容旧格式的 last_message_id）。
     """
@@ -55,25 +115,31 @@ def load_state() -> Dict[str, Dict[str, str]]:
         logging.warning("STATE_FILE 内容不是字典，将忽略")
         return {}
 
-    state: Dict[str, Dict[str, str]] = {}
+    state: Dict[str, Dict[str, Any]] = {}
     for tid, raw in data.items():
-        thread_state: Dict[str, str] = {}
+        thread_state: Dict[str, Any] = {}
         if isinstance(raw, dict):
             last_msg = raw.get("last_message_id")
             last_mention = raw.get("last_mention_id")
+            last_summary_index = _safe_int(raw.get("last_summary_index"), 0)
+            total_seen = _safe_int(raw.get("total_messages_seen"), 0)
         else:
             last_msg = raw
             last_mention = None
+            last_summary_index = 0
+            total_seen = 0
         if last_msg is not None:
             thread_state["last_message_id"] = str(last_msg)
         if last_mention is not None:
             thread_state["last_mention_id"] = str(last_mention)
+        thread_state["last_summary_index"] = last_summary_index
+        thread_state["total_messages_seen"] = total_seen
         state[str(tid)] = thread_state
     logging.info("加载状态成功，线程数=%d", len(state))
     return state
 
 
-def save_state(state: Dict[str, Dict[str, str]]) -> None:
+def save_state(state: Dict[str, Dict[str, Any]]) -> None:
     """
     将最新的 thread 状态写回磁盘。
     """
@@ -94,6 +160,8 @@ def load_thread_history(tid: str) -> list:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, list):
+            for entry in data:
+                ensure_history_entry_defaults(entry)
             return data
     except Exception as exc:
         logging.warning("读取 history 文件失败：tid=%s, err=%s", tid, exc)
@@ -124,6 +192,42 @@ def delete_thread_history(tid: str) -> None:
         logging.warning("删除 history 文件失败：tid=%s, err=%s", tid, exc)
 
 
+def load_thread_summaries(thread_id: str) -> list:
+    """
+    读取某个线程的长期摘要 data/summary/{thread_id}.json。
+    返回列表，按文件中的顺序（通常就是按时间追加）。
+    """
+    SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+    path = SUMMARY_DIR / f"{thread_id}.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        logging.warning("summary 文件格式异常：%s", path)
+        return []
+    except Exception as exc:
+        logging.warning("读取 summary 文件出错：%s", exc)
+        return []
+
+
+def save_thread_summaries(tid: str, summaries: list) -> None:
+    """
+    将长期摘要列表写回磁盘。
+    """
+    SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+    path = SUMMARY_DIR / f"{tid}.json"
+    try:
+        path.write_text(
+            json.dumps(summaries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logging.info("已保存 summary：tid=%s, 条数=%d", tid, len(summaries))
+    except Exception as exc:
+        logging.warning("保存 summary 文件失败：tid=%s, err=%s", tid, exc)
+
+
 def load_system_prompt(default_text: str) -> str:
     try:
         prompt = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
@@ -137,58 +241,220 @@ def load_system_prompt(default_text: str) -> str:
     return default_text
 
 
+def _detect_media_type(raw_item_type: str, media_obj: Any) -> str | None:
+    """Best-effort media type detection."""
+    if raw_item_type == "animated_media":
+        return "sticker"
+    if raw_item_type == "voice_media":
+        return "audio"
+    media_type_val = getattr(media_obj, "media_type", None)
+    if media_type_val == 1:
+        return "image"
+    if media_type_val == 2:
+        return "video"
+    if media_type_val == 3:
+        return "image"
+    if getattr(media_obj, "video_url", None) or getattr(media_obj, "video_versions", None):
+        return "video"
+    if getattr(media_obj, "audio_url", None) or getattr(media_obj, "audio", None):
+        return "audio"
+    if getattr(media_obj, "thumbnail_url", None) or getattr(media_obj, "image_versions2", None):
+        return "image"
+    return None
+
+
+def _extract_media_url(media_obj: Any) -> str | None:
+    """Try multiple attributes to fetch downloadable media URL."""
+    if media_obj is None:
+        return None
+    for attr in ("video_url", "audio_url", "thumbnail_url", "image_url"):
+        val = getattr(media_obj, attr, None)
+        if val:
+            return val
+    media_attr = getattr(media_obj, "media", None)
+    if isinstance(media_attr, dict):
+        for key in ("video", "video_url", "audio", "audio_url", "image", "image_url", "uri"):
+            url = media_attr.get(key)
+            if url:
+                return url
+    versions = getattr(media_obj, "video_versions", None)
+    if versions:
+        try:
+            first = versions[0]
+            if isinstance(first, dict):
+                return first.get("url")
+            return getattr(first, "url", None)
+        except Exception:
+            pass
+    versions = getattr(media_obj, "image_versions2", None)
+    if isinstance(versions, dict):
+        candidates = versions.get("candidates") or []
+        try:
+            first = candidates[0]
+            if isinstance(first, dict):
+                return first.get("url")
+            return getattr(first, "url", None)
+        except Exception:
+            pass
+    return None
+
+
+def parse_direct_message(
+    msg: DirectMessage, thread_user_map: Dict[int, str]
+) -> Dict[str, Any]:
+    """Extract a normalized history entry from DirectMessage."""
+    ts = getattr(msg, "timestamp", "")
+    try:
+        ts_str = ts.isoformat()
+    except Exception:
+        ts_str = str(ts)
+    uid = getattr(msg, "user_id", None)
+    username = thread_user_map.get(uid, f"user_{uid}") if uid is not None else "unknown"
+    reply_obj = getattr(msg, "replied_to_message", None) or getattr(msg, "reply_to_message", None)
+    reply_id = getattr(reply_obj, "id", None) if reply_obj else getattr(msg, "reply_to", None)
+    reply_id_str = str(reply_id) if reply_id else None
+
+    raw_item_type = getattr(msg, "item_type", None) or "text"
+    item_type = raw_item_type or "text"
+    text = msg.text or ""
+    caption = None
+    media_type = None
+    media_url = None
+    link_url = None
+    link_meta = None
+
+    if raw_item_type == "text":
+        item_type = "text"
+    elif raw_item_type in ("link", "shares"):
+        item_type = "link"
+        link_obj = getattr(msg, "link", None) or getattr(msg, "link_context", None)
+        link_url = getattr(link_obj, "link_url", None) or getattr(link_obj, "url", None)
+        link_meta = None
+        if link_obj:
+            link_meta = {
+                "title": getattr(link_obj, "link_title", None) or getattr(link_obj, "title", None),
+                "summary": getattr(link_obj, "link_summary", None) or getattr(link_obj, "summary", None),
+                "site": getattr(link_obj, "link_site", None) or getattr(link_obj, "site_name", None),
+            }
+            if all(v is None for v in link_meta.values()):
+                link_meta = None
+        if not text:
+            text = (link_meta or {}).get("title") or ""
+    elif raw_item_type in ("media", "raven_media", "visual_media", "animated_media"):
+        media_obj = getattr(msg, "media", None) or getattr(msg, "visual_media", None) or getattr(
+            msg, "animated_media", None
+        )
+        caption = getattr(media_obj, "caption_text", None) or getattr(media_obj, "title", None)
+        media_type = _detect_media_type(raw_item_type, media_obj)
+        media_url = _extract_media_url(media_obj)
+        item_type = media_type or ("sticker" if raw_item_type == "animated_media" else "mixed")
+    elif raw_item_type == "voice_media":
+        voice_obj = getattr(msg, "voice_media", None)
+        media_type = "audio"
+        media_url = None
+        if voice_obj is not None:
+            media_url = getattr(voice_obj, "audio", None) or getattr(voice_obj, "audio_url", None)
+            if media_url is None:
+                nested_media = getattr(voice_obj, "media", None)
+                if isinstance(nested_media, dict):
+                    media_url = (
+                        nested_media.get("audio")
+                        or nested_media.get("audio_src")
+                        or nested_media.get("url")
+                    )
+        item_type = "audio"
+    else:
+        # fallback: keep raw item_type but still record text
+        item_type = raw_item_type or "text"
+
+    # 在构造 entry 之前，统一把 URL 类字段转换为 str，避免 HttpUrl 之类对象
+    if media_url is not None and not isinstance(media_url, str):
+        try:
+            media_url = str(media_url)
+        except Exception:
+            media_url = None
+
+    if link_url is not None and not isinstance(link_url, str):
+        try:
+            link_url = str(link_url)
+        except Exception:
+            link_url = None
+
+    if isinstance(link_meta, dict):
+        for k, v in list(link_meta.items()):
+            if v is not None and not isinstance(v, str):
+                try:
+                    link_meta[k] = str(v)
+                except Exception:
+                    link_meta[k] = None
+
+    entry = {
+        "id": str(msg.id),
+        "timestamp": ts_str,
+        "user_id": uid,
+        "username": username,
+        "item_type": item_type,
+        "text": text,
+        "caption": caption,
+        "media_type": media_type,
+        "media_url": media_url,
+        "media_vl_summary": None,
+        "media_vl_tags": None,
+        "link_url": link_url,
+        "link_meta": link_meta,
+        "reply_to": reply_id_str,
+    }
+    ensure_history_entry_defaults(entry)
+    return entry
+
+
 def update_history_for_thread(
     records: list,
+    tid: str,
     new_msgs: List[DirectMessage],
     thread_user_map: Dict[int, str],
+    self_user_id: int | None = None,
+    self_username: str | None = None,
 ) -> bool:
     """
-    追加线程历史，并保持滑动窗口。
+    追加线程历史（不再截断到 50 条）。
     """
     if not new_msgs:
         return False
 
     before_len = len(records)
+    for entry in records:
+        ensure_history_entry_defaults(entry)
     existing_ids = {entry.get("id") for entry in records}
     appended = False
 
     for msg in new_msgs:
         if msg.id in existing_ids:
             continue
-        ts = getattr(msg, "timestamp", "")
-        try:
-            ts_str = ts.isoformat()
-        except Exception:
-            ts_str = str(ts)
-        uid = getattr(msg, "user_id", None)
-        username = thread_user_map.get(uid, f"user_{uid}") if uid is not None else "unknown"
-        reply_obj = getattr(msg, "replied_to_message", None) or getattr(msg, "reply_to_message", None)
-        reply_id = getattr(reply_obj, "id", None) if reply_obj else getattr(msg, "reply_to", None)
-        reply_id_str = str(reply_id) if reply_id else None
-
-        records.append(
-            {
-                "id": str(msg.id),
-                "timestamp": ts_str,
-                "user_id": uid,
-                "username": username,
-                "text": msg.text or "",
-                "reply_to": reply_id_str,
-            }
-        )
+        entry = parse_direct_message(msg, thread_user_map)
+        records.append(entry)
         appended = True
 
-    trimmed = records[-50:]
-    records[:] = trimmed
-    return appended or len(trimmed) != before_len
+    trimmed_records = records[-50:]
+
+    # 统一把自己的用户名修正成标准形式
+    if self_user_id is not None and self_username:
+        for entry in trimmed_records:
+            if entry.get("user_id") == self_user_id:
+                entry["username"] = self_username
+            if entry.get("username") == f"user_{self_user_id}":
+                entry["username"] = self_username
+
+    return appended or len(records) != before_len
 
 
-def build_context(
+def build_recent_context(
     thread_history: list,
     last_focus_id: str | None = None,
 ) -> str:
     """
-    把 per-thread 历史整理为模型可读的上下文。
+    根据单个线程的 history 生成最近消息上下文（含 Focus 窗口）。
+    只关心最近若干条消息（例如 50 条），不包含长期摘要。
     """
     if not thread_history:
         return "[Participants]\n- (unknown)\n[Recent messages]\n(暂无历史记录)"
@@ -231,8 +497,22 @@ def build_context(
             ts_fmt = ts_str
 
         username = entry.get("username") or f"user_{entry.get('user_id')}"
-        text_clean = (entry.get("text") or "").replace("\n", " ").strip()
+        text_clean = (entry.get("text") or entry.get("caption") or "").replace("\n", " ").strip()
         lines.append(f"{ts_fmt} | {username}: {text_clean}")
+
+        media_type = entry.get("media_type")
+        if media_type:
+            if media_type == "image":
+                media_desc = "一条图片消息"
+            elif media_type == "video":
+                media_desc = "一条视频消息"
+            elif media_type == "audio":
+                media_desc = "一条语音消息"
+            elif media_type == "sticker":
+                media_desc = "一条贴纸/表情消息"
+            else:
+                media_desc = f"一条 {media_type} 消息"
+            lines.append(f"  [媒体内容] {media_desc}")
 
         reply_to = entry.get("reply_to")
         if reply_to and reply_to in id_to_entry:
@@ -263,6 +543,70 @@ def build_context(
         lines.append("---- End focus window ----")
 
     return "\n".join(lines)
+
+
+def format_summaries_for_context(thread_id: str, max_blocks: int = 3) -> str:
+    """
+    从 summary 文件中取最近几段摘要，压缩成一段「长期记忆」背景。
+    只提供给模型一个大致印象，避免太长。
+    """
+    summaries = load_thread_summaries(thread_id)
+    if not summaries:
+        return ""
+
+    # 只取最近 max_blocks 段摘要
+    blocks = summaries[-max_blocks:]
+    lines: List[str] = ["[Long-term memory]"]
+
+    for blk in blocks:
+        time_start = blk.get("time_start") or ""
+        time_end = blk.get("time_end") or ""
+        msg_count = blk.get("message_count") or 0
+
+        # 参与者名字，最多 4 个
+        participants = blk.get("participants") or []
+        names: List[str] = []
+        for p in participants:
+            uname = p.get("username") or f"user_{p.get('user_id')}"
+            if uname not in names:
+                names.append(uname)
+            if len(names) >= 4:
+                break
+        names_str = "、".join(names) if names else "若干群成员"
+
+        topics = blk.get("topics") or []
+        important = blk.get("important_points") or []
+
+        topics_str = "；".join(topics[:2]) if topics else ""
+        important_str = "；".join(important[:2]) if important else ""
+
+        lines.append(
+            f"- 时间段 {time_start} ~ {time_end}，约 {msg_count} 条消息，主要参与者：{names_str}"
+        )
+        if topics_str:
+            lines.append(f"  · 主要话题：{topics_str}")
+        if important_str:
+            lines.append(f"  · 关键记忆点：{important_str}")
+
+    return "\n".join(lines)
+
+
+def build_context_with_memory(
+    thread_id: str,
+    thread_history: list,
+    last_focus_id: str | None = None,
+) -> str:
+    """
+    最终发给 Qwen 的上下文：
+    1. 前半部分是若干段长期摘要 [Long-term memory]
+    2. 后半部分是最近消息窗口 [Participants] + [Recent messages]
+    """
+    long_term = format_summaries_for_context(thread_id)
+    recent = build_recent_context(thread_history, last_focus_id)
+
+    if long_term:
+        return long_term + "\n\n" + recent
+    return recent
 
 
 def ask_qwen(context_text: str) -> str:
@@ -323,6 +667,234 @@ def ask_qwen(context_text: str) -> str:
     return reply
 
 
+def compute_batch_stats(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    计算一段消息的基础统计信息。
+    """
+    if not batch:
+        return {
+            "time_start": "",
+            "time_end": "",
+            "message_count": 0,
+            "participants": [],
+        }
+    participants_count: Dict[Tuple[Any, Any], int] = defaultdict(int)
+    for entry in batch:
+        uid = entry.get("user_id")
+        uname = entry.get("username") or f"user_{uid}"
+        participants_count[(uid, uname)] += 1
+
+    participants = [
+        {"user_id": uid, "username": uname, "message_count": cnt}
+        for (uid, uname), cnt in sorted(
+            participants_count.items(), key=lambda kv: kv[1], reverse=True
+        )
+    ]
+
+    time_start = batch[0].get("timestamp") or ""
+    time_end = batch[-1].get("timestamp") or ""
+    return {
+        "time_start": time_start,
+        "time_end": time_end,
+        "message_count": len(batch),
+        "participants": participants,
+    }
+
+
+def format_batch_for_summary(batch: List[Dict[str, Any]], stats: Dict[str, Any]) -> str:
+    """
+    把 50 条消息 + 预统计信息，整理成一个发给 Qwen 的文本。
+    """
+    lines: List[str] = [
+        "【对话时间范围】",
+        f"起始时间: {stats.get('time_start', '')}",
+        f"结束时间: {stats.get('time_end', '')}",
+        f"消息总数: {stats.get('message_count', len(batch))}",
+        "",
+        "【参与者及发言条数】",
+    ]
+    participants = stats.get("participants") or []
+    if participants:
+        for p in participants:
+            lines.append(
+                f"- 用户名: {p.get('username')} (user_id={p.get('user_id')}), 发言条数: {p.get('message_count')}"
+            )
+    else:
+        lines.append("- (unknown)")
+
+    lines.append("")
+    lines.append("【原始对话记录】(按时间从旧到新)")
+    for entry in batch:
+        ts_str = entry.get("timestamp") or ""
+        username = entry.get("username") or f"user_{entry.get('user_id')}"
+        text = (entry.get("text") or entry.get("caption") or "").replace("\n", " ").strip()
+        if not text:
+            text = "(无文本，仅媒体)"
+        lines.append(f"{ts_str} | {username}: {text}")
+        if entry.get("media_type"):
+            media_type = entry.get("media_type")
+            if media_type == "image":
+                media_desc = "一条图片消息"
+            elif media_type == "video":
+                media_desc = "一条视频消息"
+            elif media_type == "audio":
+                media_desc = "一条语音消息"
+            elif media_type == "sticker":
+                media_desc = "一条贴纸/表情消息"
+            else:
+                media_desc = f"一条 {media_type} 消息"
+            lines.append(f"  [媒体内容] {media_desc}")
+    return "\n".join(lines)
+
+
+def ask_qwen_summary(summary_context: str) -> Dict[str, Any]:
+    """
+    调用 Qwen 文本模型生成结构化摘要。
+    """
+    api_key = os.getenv("QWEN_API_KEY")
+    api_url = os.getenv("QWEN_API_URL")
+    model = os.getenv("QWEN_SUMMARY_MODEL") or os.getenv("QWEN_MODEL") or "qwen2.5-32b-instruct"
+
+    if not api_key:
+        raise RuntimeError("缺少 QWEN_API_KEY")
+    if not api_url:
+        raise RuntimeError("缺少 QWEN_API_URL")
+
+    system_prompt = (
+        "你是一个对话分析助手。给你一段群聊记录（含时间、用户名、文本）和预统计信息，"
+        "请用 JSON 格式输出："
+        "1. topics: 本段对话涉及的主要话题列表（字符串数组）；"
+        "2. personas: 每个用户的一句话性格/说话风格描述，数组，每个元素形如 "
+        '{"username": "...", "description": "..."}; '
+        "3. important_points: 本段对话中需要后续记住的重点事项或 TODO，字符串数组；"
+        "4. raw_summary: 对这一段对话的详细自然语言总结（一两段话）。只输出 JSON，不要额外解释。"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": summary_context},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 2048,
+    }
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=90)
+        resp.raise_for_status()
+    except Exception as exc:
+        logging.error("请求 Qwen(summary) 失败：%s", exc)
+        raise
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        logging.error("解析 Qwen(summary) 返回值失败：%s，原始内容=%s", exc, resp.text)
+        raise RuntimeError("Qwen summary 响应格式异常") from exc
+
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Qwen summary 返回内容为空")
+    content = content.strip()
+    try:
+        summary_obj = json.loads(content)
+    except Exception:
+        logging.warning("Qwen summary 返回非 JSON，使用兜底文本")
+        summary_obj = {
+            "topics": [],
+            "personas": [],
+            "important_points": [],
+            "raw_summary": content,
+        }
+    return summary_obj
+
+
+def summarize_and_append(thread_id: str, batch: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """
+    对某个线程的一段消息做摘要，并追加到 summary 文件。
+    """
+    if not batch:
+        return None
+    stats = compute_batch_stats(batch)
+    summary_context = format_batch_for_summary(batch, stats)
+    try:
+        llm_summary = ask_qwen_summary(summary_context)
+    except Exception as exc:
+        logging.error("生成摘要失败：%s", exc, exc_info=True)
+        return None
+
+    summaries = load_thread_summaries(thread_id)
+    record = {
+        "summary_id": len(summaries) + 1,
+        "thread_id": thread_id,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "time_start": stats.get("time_start"),
+        "time_end": stats.get("time_end"),
+        "message_count": stats.get("message_count"),
+        "participants": stats.get("participants"),
+        "topics": llm_summary.get("topics") or [],
+        "personas": llm_summary.get("personas") or [],
+        "important_points": llm_summary.get("important_points") or [],
+        "raw_summary": llm_summary.get("raw_summary") or "",
+    }
+    summaries.append(record)
+    save_thread_summaries(thread_id, summaries)
+    return record
+
+
+def send_typing_indicator(client: Client, thread_id: str) -> None:
+    """
+    尝试向指定 thread 发送“正在输入”状态，失败时仅记录日志。
+    """
+    try:
+        client.private_request(
+            "direct_v2/threads/broadcast/activity/",
+            data={
+                "activity_status": "typing",
+                "thread_id": thread_id,
+            },
+        )
+        logging.info("Sent typing indicator: thread=%s", thread_id)
+    except Exception as exc:
+        logging.debug("Failed to send typing indicator for thread %s: %s", thread_id, exc)
+
+
+def mark_message_seen(
+    client: Client,
+    thread_id: str,
+    msg: DirectMessage,
+    thread_user_map: Dict[int, str],
+    is_dm: bool,
+) -> None:
+    """
+    尝试标记指定消息为已读，并输出调试日志。
+    """
+    if msg is None:
+        return
+    logging.info(
+        "Sending seen: thread=%s, msg_id=%s, username=%s, is_dm=%s",
+        thread_id,
+        msg.id,
+        thread_user_map.get(msg.user_id),
+        is_dm,
+    )
+    try:
+        client.direct_message_seen(thread_id, msg.id)
+    except Exception as exc:
+        logging.error(
+            "direct_message_seen failed: thread=%s, msg_id=%s, err=%s",
+            thread_id,
+            msg.id,
+            exc,
+            exc_info=True,
+        )
+
+
 def login_client(username: str, password: str) -> Client:
     """
     封装登录逻辑：优先复用 session.json。
@@ -361,6 +933,8 @@ def main_loop() -> None:
 
     mention_token = f"@{(mention_name or '').lower()}"
     logging.info("监听被 @ 关键字：%s，DEBUG_IGNORE_MENTION=%s", mention_token, DEBUG_IGNORE_MENTION)
+    enable_seen = os.getenv("ENABLE_SEEN", "true").lower() == "true"
+    logging.info("ENABLE_SEEN=%s", enable_seen)
 
     last_activity_ts = time.time()
 
@@ -378,6 +952,7 @@ def main_loop() -> None:
                 participants = thread.users
                 is_private = len(participants) == 1
                 thread_user_map = {user.pk: user.username for user in participants}
+                thread_user_map[my_pk] = me.username
                 logging.info(
                     "线程调试：thread_id=%s, participants=%s, is_private=%s",
                     tid,
@@ -394,6 +969,15 @@ def main_loop() -> None:
 
                 messages_sorted = sorted(messages, key=lambda m: m.timestamp)
                 thread_state = state.get(tid, {})
+                if tid not in state:
+                    state[tid] = thread_state
+                    state_dirty = True
+                if "last_summary_index" not in thread_state:
+                    thread_state["last_summary_index"] = 0
+                    state_dirty = True
+                if "total_messages_seen" not in thread_state:
+                    thread_state["total_messages_seen"] = len(thread_history)
+                    state_dirty = True
                 last_seen_id = thread_state.get("last_message_id")
                 last_focus_id = thread_state.get("last_mention_id")
                 logging.info(
@@ -423,13 +1007,21 @@ def main_loop() -> None:
 
                 had_new_messages = True
                 changed = update_history_for_thread(
-                    thread_history, new_msgs, thread_user_map
+                    thread_history,
+                    tid,
+                    new_msgs,
+                    thread_user_map,
+                    self_user_id=my_pk,
+                    self_username=me.username,
                 )
                 if changed:
                     save_thread_history(tid, thread_history)
+                    thread_state["total_messages_seen"] = len(thread_history)
+                    state_dirty = True
 
                 mention_msgs: List[DirectMessage] = []
                 reply_candidate: DirectMessage | None = None
+                other_new_msgs: List[DirectMessage] = []
 
                 for msg in new_msgs:
                     thread_state["last_message_id"] = msg.id
@@ -437,6 +1029,8 @@ def main_loop() -> None:
                     state_dirty = True
 
                     text_lower = (msg.text or "").lower()
+                    if msg.user_id != my_pk:
+                        other_new_msgs.append(msg)
                     if msg.user_id == my_pk:
                         logging.info("线程 %s 最新消息来自自己，跳过 msg_id=%s", tid, msg.id)
                         continue
@@ -446,6 +1040,8 @@ def main_loop() -> None:
                         delete_thread_history(tid)
                         thread_history = []
                         thread_state["last_mention_id"] = None
+                        thread_state["last_summary_index"] = len(thread_history)
+                        thread_state["total_messages_seen"] = len(thread_history)
                         last_focus_id = None
                         state_dirty = True
                         cl.direct_answer(tid, "记忆已全部清空")
@@ -455,6 +1051,11 @@ def main_loop() -> None:
                         logging.info("收到 /forget：thread=%s, msg_id=%s", tid, msg.id)
                         thread_history = thread_history[-10:]
                         save_thread_history(tid, thread_history)
+                        thread_state["last_summary_index"] = min(
+                            thread_state.get("last_summary_index", 0), len(thread_history)
+                        )
+                        thread_state["total_messages_seen"] = len(thread_history)
+                        state_dirty = True
                         cl.direct_answer(tid, "已忘记较早的记录，仅保留最近几条")
                         continue
 
@@ -476,6 +1077,56 @@ def main_loop() -> None:
                         text_lower,
                     )
 
+                # 长期摘要触发
+                last_summary_index = _safe_int(thread_state.get("last_summary_index"), 0)
+                if last_summary_index > len(thread_history):
+                    last_summary_index = len(thread_history)
+                while len(thread_history) - last_summary_index >= SUMMARY_BATCH_SIZE:
+                    batch = thread_history[
+                        last_summary_index : last_summary_index + SUMMARY_BATCH_SIZE
+                    ]
+                    summary_record = summarize_and_append(tid, batch)
+                    if summary_record:
+                        logging.info(
+                            "新增 summary：thread=%s, summary_id=%s, 新索引=%s",
+                            tid,
+                            summary_record.get("summary_id"),
+                            last_summary_index + SUMMARY_BATCH_SIZE,
+                        )
+                        last_summary_index += SUMMARY_BATCH_SIZE
+                        thread_state["last_summary_index"] = last_summary_index
+                        state_dirty = True
+                    else:
+                        break
+                thread_state["total_messages_seen"] = len(thread_history)
+                if len(thread_history) > MAX_HISTORY_KEEP:
+                    trim_count = len(thread_history) - MAX_HISTORY_KEEP
+                    logging.info(
+                        "裁剪历史：thread=%s, trim_count=%d, 原总数=%d",
+                        tid,
+                        trim_count,
+                        len(thread_history) + trim_count,
+                    )
+                    del thread_history[:trim_count]
+                    thread_state["last_summary_index"] = max(
+                        0, thread_state.get("last_summary_index", 0) - trim_count
+                    )
+                    thread_state["total_messages_seen"] = len(thread_history)
+                    state_dirty = True
+                    save_thread_history(tid, thread_history)
+                state[tid] = thread_state
+
+                if enable_seen and is_private and other_new_msgs:
+                    msg_to_seen = other_new_msgs[-1]
+                    if msg_to_seen.user_id != my_pk:
+                        mark_message_seen(
+                            cl,
+                            tid,
+                            msg_to_seen,
+                            thread_user_map,
+                            is_dm=True,
+                        )
+
                 target_msg: DirectMessage | None = None
                 focus_id_for_context = None
                 if DEBUG_IGNORE_MENTION:
@@ -488,7 +1139,18 @@ def main_loop() -> None:
                     focus_id_for_context = last_focus_id
 
                 if target_msg:
-                    context = build_context(thread_history, focus_id_for_context)
+                    if enable_seen and not is_private and target_msg.user_id != my_pk:
+                        mark_message_seen(
+                            cl,
+                            tid,
+                            target_msg,
+                            thread_user_map,
+                            is_dm=False,
+                        )
+
+                    context = build_context_with_memory(
+                        tid, thread_history, focus_id_for_context
+                    )
                     logging.info(
                         "构造上下文完成，长度=%d, target_msg=%s, mention_count=%d",
                         len(context),
@@ -496,7 +1158,8 @@ def main_loop() -> None:
                         len(mention_msgs),
                     )
                     # 随机等待，模拟“思考中”，降低触发风控概率
-                    time.sleep(random.uniform(1.0, 3.0))
+                    send_typing_indicator(cl, tid)
+                    time.sleep(random.uniform(1.0, 2.0))
 
                     try:
                         reply = ask_qwen(context)
