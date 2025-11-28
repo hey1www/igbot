@@ -5,7 +5,7 @@ import random
 import re
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -40,6 +40,75 @@ logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
 )
+
+
+CONFIG_MENU_TEXT = """[heyi bot config · current chat]
+
+Reply mode (reply mode)
+  quiet       – never auto-reply (only system/config messages)
+  @andreply   – reply when I’m @mentioned or someone replies directly to my message
+  mention     – reply when I’m @mentioned, replied to, or people say “bot” / “ai” / “robot”
+  all         – reply to every non-command message
+
+Commands for reply mode:
+  /mode quiet
+  /mode @andreply
+  /mode mention
+  /mode all
+
+
+Memory & history (this chat only)
+  /mem trim          – drop the oldest 40 messages from the last 50
+  /mem clear_recent  – clear all recent short-term memory (two-step confirm)
+  /mem toggle_long   – turn long-term memory ON / OFF in replies
+  /mem toggle_fish   – toggle “goldfish mode” (only see the last 10 messages)
+  /mem clear_all     – delete ALL memory for this chat (short + long-term, two-step confirm)
+
+Summary tools
+  /summary last      – show the latest long-term summary for this chat
+  /summary 50        – summarise the last 50 messages into a few lines
+  /summary 1h        – summarise roughly the last 1 hour of conversation
+
+Style settings
+  /maxlen N          – set maximum reply length (e.g. /maxlen 300)
+  /temp T            – set temperature 0.1–1.0 (higher = more playful, lower = calmer)
+
+Config input helper
+  In config commands, underscores "_" in arguments should be treated as spaces.
+  For example, "hello_world" will be interpreted as "hello world".
+
+Exit config
+  /exit              – leave config mode and go back to normal behaviour
+
+While this config menu is active I will poll every 1s.
+After /exit I will return to the normal random polling interval.
+""".strip()
+
+REPLY_KEYWORDS = ["bot", "ai", "机器人", "人工智能"]
+
+
+def normalize_arg_text(s: str) -> str:
+    return s.replace("_", " ").strip()
+
+
+def ensure_thread_state_defaults(thread_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Backfill newly added thread state fields for compatibility.
+    """
+    thread_state = dict(thread_state) if thread_state else {}
+    thread_state.setdefault("last_message_id", None)
+    thread_state.setdefault("last_mention_id", None)
+    thread_state.setdefault("last_summary_index", 0)
+    thread_state.setdefault("total_messages_seen", 0)
+    thread_state.setdefault("config_mode", False)
+    thread_state.setdefault("reply_mode", "@andreply")
+    thread_state.setdefault("long_memory_enabled", True)
+    thread_state.setdefault("fish_mode", False)
+    thread_state.setdefault("pending_memory_action", None)
+    thread_state.setdefault("pending_memory_user_id", None)
+    thread_state.setdefault("max_reply_len", 256)
+    thread_state.setdefault("temperature", 0.5)
+    return thread_state
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -98,6 +167,18 @@ def ensure_history_entry_defaults(entry: Dict[str, Any]) -> None:
     entry.setdefault("reply_to", entry.get("reply_to"))
 
 
+def parse_timestamp(ts_str: str) -> datetime | None:
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+
 def load_state() -> Dict[str, Dict[str, Any]]:
     """
     从 state.json 读出每个 thread 的状态（兼容旧格式的 last_message_id）。
@@ -134,6 +215,7 @@ def load_state() -> Dict[str, Dict[str, Any]]:
             thread_state["last_mention_id"] = str(last_mention)
         thread_state["last_summary_index"] = last_summary_index
         thread_state["total_messages_seen"] = total_seen
+        thread_state = ensure_thread_state_defaults(thread_state)
         state[str(tid)] = thread_state
     logging.info("加载状态成功，线程数=%d", len(state))
     return state
@@ -226,6 +308,16 @@ def save_thread_summaries(tid: str, summaries: list) -> None:
         logging.info("已保存 summary：tid=%s, 条数=%d", tid, len(summaries))
     except Exception as exc:
         logging.warning("保存 summary 文件失败：tid=%s, err=%s", tid, exc)
+
+def delete_thread_summaries(tid: str) -> None:
+    path = SUMMARY_DIR / f"{tid}.json"
+    try:
+        path.unlink()
+        logging.info("已删除 summary 文件：tid=%s", tid)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logging.warning("删除 summary 文件失败：tid=%s, err=%s", tid, exc)
 
 
 def load_system_prompt(default_text: str) -> str:
@@ -595,13 +687,19 @@ def build_context_with_memory(
     thread_id: str,
     thread_history: list,
     last_focus_id: str | None = None,
+    fish_mode: bool = False,
+    long_memory_enabled: bool = True,
 ) -> str:
     """
     最终发给 Qwen 的上下文：
     1. 前半部分是若干段长期摘要 [Long-term memory]
     2. 后半部分是最近消息窗口 [Participants] + [Recent messages]
     """
-    long_term = format_summaries_for_context(thread_id)
+    if fish_mode:
+        recent_window = thread_history[-10:]
+        return build_recent_context(recent_window, last_focus_id)
+
+    long_term = format_summaries_for_context(thread_id) if long_memory_enabled else ""
     recent = build_recent_context(thread_history, last_focus_id)
 
     if long_term:
@@ -609,7 +707,7 @@ def build_context_with_memory(
     return recent
 
 
-def ask_qwen(context_text: str) -> str:
+def ask_qwen(context_text: str, temperature: float = 0.7, max_tokens: int = 256) -> str:
     """
     通过兼容 OpenAI 的 /chat/completions 接口调用 Qwen。
     """
@@ -640,11 +738,17 @@ def ask_qwen(context_text: str) -> str:
                 "content": context_text,
             },
         ],
-        "temperature": 0.7,
-        "max_tokens": 256,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
     }
 
-    logging.info("调用 Qwen：model=%s, payload_messages=%d", model, len(payload["messages"]))
+    logging.info(
+        "调用 Qwen：model=%s, payload_messages=%d, temperature=%s, max_tokens=%s",
+        model,
+        len(payload["messages"]),
+        payload["temperature"],
+        payload["max_tokens"],
+    )
 
     try:
         resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
@@ -847,6 +951,261 @@ def summarize_and_append(thread_id: str, batch: List[Dict[str, Any]]) -> Dict[st
     return record
 
 
+def summarize_messages_inline(messages: List[Dict[str, Any]]) -> str | None:
+    """
+    生成即时摘要（不写入文件），返回 raw_summary 文本。
+    """
+    if not messages:
+        return None
+    stats = compute_batch_stats(messages)
+    summary_context = format_batch_for_summary(messages, stats)
+    try:
+        summary_obj = ask_qwen_summary(summary_context)
+    except Exception as exc:
+        logging.error("即时摘要失败：%s", exc, exc_info=True)
+        return None
+    return summary_obj.get("raw_summary") or ""
+
+
+def handle_mode_command(
+    text: str,
+    thread_state: Dict[str, Any],
+    tid: str,
+    client: Client,
+) -> bool:
+    normalized = normalize_arg_text(text)
+    parts = normalized.split()
+    if not parts or not parts[0].lower().startswith("/mode"):
+        return False
+    if len(parts) < 2:
+        client.direct_answer(tid, "Usage: /mode <quiet|@andreply|mention|all>")
+        return True
+    mode = parts[1].lower()
+    if mode not in ("quiet", "@andreply", "mention", "all"):
+        client.direct_answer(tid, "Usage: /mode <quiet|@andreply|mention|all>")
+        return True
+    thread_state["reply_mode"] = mode
+    client.direct_answer(tid, f"Reply mode set to: {mode}")
+    logging.info("调试：设置 reply_mode=%s, thread=%s", mode, tid)
+    return True
+
+
+def handle_maxlen_command(
+    text: str,
+    thread_state: Dict[str, Any],
+    tid: str,
+    client: Client,
+) -> bool:
+    normalized = normalize_arg_text(text)
+    parts = normalized.split()
+    if not parts or not parts[0].lower().startswith("/maxlen"):
+        return False
+    if len(parts) < 2:
+        client.direct_answer(tid, "Usage: /maxlen <number>, e.g. /maxlen 300")
+        return True
+    try:
+        val = int(float(parts[1]))
+    except Exception:
+        client.direct_answer(tid, "Usage: /maxlen <number>, e.g. /maxlen 300")
+        return True
+    val = max(32, min(2048, val))
+    thread_state["max_reply_len"] = val
+    client.direct_answer(tid, f"Max reply length set to {val}.")
+    logging.info("调试：设置 max_reply_len=%s, thread=%s", val, tid)
+    return True
+
+
+def handle_temp_command(
+    text: str,
+    thread_state: Dict[str, Any],
+    tid: str,
+    client: Client,
+) -> bool:
+    normalized = normalize_arg_text(text)
+    parts = normalized.split()
+    if not parts or not parts[0].lower().startswith("/temp"):
+        return False
+    if len(parts) < 2:
+        client.direct_answer(tid, "Usage: /temp <0.1-1.0>, e.g. /temp 0.6")
+        return True
+    try:
+        val = float(parts[1])
+    except Exception:
+        client.direct_answer(tid, "Usage: /temp <0.1-1.0>, e.g. /temp 0.6")
+        return True
+    val = max(0.1, min(1.0, val))
+    thread_state["temperature"] = val
+    client.direct_answer(tid, f"Temperature set to {val:.2f}.")
+    logging.info("调试：设置 temperature=%s, thread=%s", val, tid)
+    return True
+
+
+def handle_mem_command(
+    msg: DirectMessage,
+    thread_state: Dict[str, Any],
+    thread_history: list,
+    tid: str,
+    client: Client,
+) -> tuple[bool, list, bool]:
+    text = msg.text or ""
+    normalized = normalize_arg_text(text)
+    parts = normalized.split()
+    if not parts or not parts[0].lower().startswith("/mem"):
+        return False, thread_history, False
+
+    state_dirty = False
+    if len(parts) < 2:
+        client.direct_answer(
+            tid,
+            "Usage: /mem <trim|toggle_long|toggle_fish|clear_recent|clear_all>",
+        )
+        return True, thread_history, state_dirty
+
+    sub = parts[1].lower()
+    if sub == "trim":
+        if len(thread_history) < 10:
+            client.direct_answer(tid, "Not enough messages to trim.")
+            return True, thread_history, state_dirty
+        if len(thread_history) >= 50:
+            kept_prefix = thread_history[:-50]
+            new_tail = thread_history[-10:]
+            thread_history = kept_prefix + new_tail
+        else:
+            thread_history = thread_history[-10:]
+        save_thread_history(tid, thread_history)
+        thread_state["last_summary_index"] = min(
+            thread_state.get("last_summary_index", 0), len(thread_history)
+        )
+        thread_state["total_messages_seen"] = len(thread_history)
+        state_dirty = True
+        client.direct_answer(tid, "Trimmed recent history for this chat.")
+        logging.info("调试：/mem trim 完成, thread=%s, new_len=%d", tid, len(thread_history))
+        return True, thread_history, state_dirty
+
+    if sub == "toggle_long":
+        thread_state["long_memory_enabled"] = not thread_state.get("long_memory_enabled", True)
+        client.direct_answer(
+            tid,
+            "Long-term memory is now ON."
+            if thread_state["long_memory_enabled"]
+            else "Long-term memory is now OFF.",
+        )
+        state_dirty = True
+        logging.info("调试：long_memory_enabled=%s, thread=%s", thread_state["long_memory_enabled"], tid)
+        return True, thread_history, state_dirty
+
+    if sub == "toggle_fish":
+        thread_state["fish_mode"] = not thread_state.get("fish_mode", False)
+        client.direct_answer(
+            tid,
+            "Goldfish mode is now ON (I will only look at the last 10 messages)."
+            if thread_state["fish_mode"]
+            else "Goldfish mode is now OFF.",
+        )
+        state_dirty = True
+        logging.info("调试：fish_mode=%s, thread=%s", thread_state["fish_mode"], tid)
+        return True, thread_history, state_dirty
+
+    if sub == "clear_recent":
+        thread_state["pending_memory_action"] = "clear_recent"
+        thread_state["pending_memory_user_id"] = msg.user_id
+        client.direct_answer(
+            tid,
+            'You are about to CLEAR recent memory for this chat.\nType "yes" to confirm, or "no" to cancel.',
+        )
+        state_dirty = True
+        logging.info("调试：等待 clear_recent 确认, thread=%s", tid)
+        return True, thread_history, state_dirty
+
+    if sub == "clear_all":
+        thread_state["pending_memory_action"] = "clear_all"
+        thread_state["pending_memory_user_id"] = msg.user_id
+        client.direct_answer(
+            tid,
+            'WARNING: This will DELETE ALL memory for this chat (recent + long-term).\nType "yes" to confirm, or "no" to cancel.',
+        )
+        state_dirty = True
+        logging.info("调试：等待 clear_all 确认, thread=%s", tid)
+        return True, thread_history, state_dirty
+
+    client.direct_answer(
+        tid,
+        "Usage: /mem <trim|toggle_long|toggle_fish|clear_recent|clear_all>",
+    )
+    return True, thread_history, state_dirty
+
+
+def handle_summary_command(
+    msg: DirectMessage,
+    thread_history: list,
+    tid: str,
+    client: Client,
+) -> bool:
+    text = msg.text or ""
+    normalized = normalize_arg_text(text)
+    parts = normalized.split()
+    if not parts or not parts[0].lower().startswith("/summary"):
+        return False
+    if len(parts) < 2:
+        client.direct_answer(tid, "Usage: /summary <last|50|1h>")
+        return True
+
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].lower() == "h":
+        sub = f"{parts[1]}h"
+    else:
+        sub = parts[1].lower()
+
+    if sub == "last":
+        summaries = load_thread_summaries(tid)
+        if not summaries:
+            client.direct_answer(tid, "No long-term summary yet for this chat.")
+            return True
+        latest = summaries[-1]
+        raw_summary = latest.get("raw_summary") or ""
+        client.direct_answer(
+            tid,
+            f"Latest long-term memory for this chat:\n\n{raw_summary}",
+        )
+        return True
+
+    if sub == "50":
+        batch = thread_history[-50:]
+        summary_text = summarize_messages_inline(batch)
+        if summary_text:
+            client.direct_answer(
+                tid,
+                f"Recap of the last 50 messages:\n\n{summary_text}",
+            )
+        else:
+            client.direct_answer(tid, "Unable to summarise the last 50 messages.")
+        return True
+
+    m = re.match(r"^(\d+)h$", sub)
+    if m:
+        hours = int(m.group(1))
+        cutoff = time.time() - hours * 3600
+        filtered = []
+        for entry in thread_history:
+            ts_obj = parse_timestamp(entry.get("timestamp", ""))
+            if ts_obj and ts_obj.timestamp() >= cutoff:
+                filtered.append(entry)
+        if not filtered:
+            client.direct_answer(tid, f"No messages in the last {hours}h.")
+            return True
+        summary_text = summarize_messages_inline(filtered)
+        if summary_text:
+            client.direct_answer(
+                tid,
+                f"Recap of the last {hours}h:\n\n{summary_text}",
+            )
+        else:
+            client.direct_answer(tid, f"Unable to summarise the last {hours}h.")
+        return True
+
+    client.direct_answer(tid, "Usage: /summary <last|50|1h>")
+    return True
+
+
 def send_typing_indicator(client: Client, thread_id: str) -> None:
     """
     尝试向指定 thread 发送“正在输入”状态，失败时仅记录日志。
@@ -924,7 +1283,8 @@ def main_loop() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    state = load_state()
+    state_raw = load_state()
+    state = {tid: ensure_thread_state_defaults(st) for tid, st in state_raw.items()}
 
     cl = login_client(ig_username, ig_password)
     me = cl.user_info_by_username(ig_username)
@@ -968,16 +1328,8 @@ def main_loop() -> None:
                     continue
 
                 messages_sorted = sorted(messages, key=lambda m: m.timestamp)
-                thread_state = state.get(tid, {})
-                if tid not in state:
-                    state[tid] = thread_state
-                    state_dirty = True
-                if "last_summary_index" not in thread_state:
-                    thread_state["last_summary_index"] = 0
-                    state_dirty = True
-                if "total_messages_seen" not in thread_state:
-                    thread_state["total_messages_seen"] = len(thread_history)
-                    state_dirty = True
+                thread_state = ensure_thread_state_defaults(state.get(tid, {}))
+                state[tid] = thread_state
                 last_seen_id = thread_state.get("last_message_id")
                 last_focus_id = thread_state.get("last_mention_id")
                 logging.info(
@@ -1019,9 +1371,9 @@ def main_loop() -> None:
                     thread_state["total_messages_seen"] = len(thread_history)
                     state_dirty = True
 
-                mention_msgs: List[DirectMessage] = []
-                reply_candidate: DirectMessage | None = None
                 other_new_msgs: List[DirectMessage] = []
+                target_msg: DirectMessage | None = None
+                focus_id_for_context = None
 
                 for msg in new_msgs:
                     thread_state["last_message_id"] = msg.id
@@ -1035,36 +1387,6 @@ def main_loop() -> None:
                         logging.info("线程 %s 最新消息来自自己，跳过 msg_id=%s", tid, msg.id)
                         continue
 
-                    if "/forgetall" in text_lower:
-                        logging.info("收到 /forgetall：thread=%s, msg_id=%s", tid, msg.id)
-                        delete_thread_history(tid)
-                        thread_history = []
-                        thread_state["last_mention_id"] = None
-                        thread_state["last_summary_index"] = len(thread_history)
-                        thread_state["total_messages_seen"] = len(thread_history)
-                        last_focus_id = None
-                        state_dirty = True
-                        cl.direct_answer(tid, "记忆已全部清空")
-                        continue
-
-                    if "/forget" in text_lower:
-                        logging.info("收到 /forget：thread=%s, msg_id=%s", tid, msg.id)
-                        thread_history = thread_history[-10:]
-                        save_thread_history(tid, thread_history)
-                        thread_state["last_summary_index"] = min(
-                            thread_state.get("last_summary_index", 0), len(thread_history)
-                        )
-                        thread_state["total_messages_seen"] = len(thread_history)
-                        state_dirty = True
-                        cl.direct_answer(tid, "已忘记较早的记录，仅保留最近几条")
-                        continue
-
-                    if not is_private and mention_token in text_lower:
-                        mention_msgs.append(msg)
-
-                    if DEBUG_IGNORE_MENTION or is_private or mention_token in text_lower:
-                        reply_candidate = msg
-
                     logging.info(
                         "新消息调试：thread=%s, msg_id=%s, from_user_id=%s, username=%s, "
                         "timestamp=%s, text=%r, lower=%r",
@@ -1077,10 +1399,168 @@ def main_loop() -> None:
                         text_lower,
                     )
 
-                # 长期摘要触发
+                    text_raw = msg.text or ""
+                    stripped_lower = text_raw.strip().lower()
+                    is_explicit_mention = mention_token in text_lower if mention_token else False
+                    reply_obj = getattr(msg, "replied_to_message", None) or getattr(msg, "reply_to_message", None)
+                    reply_to_user_id = getattr(reply_obj, "user_id", None)
+                    is_direct_reply_to_me = reply_to_user_id == my_pk
+                    contains_keyword_mention = any(k in text_lower for k in REPLY_KEYWORDS)
+                    logging.info(
+                        "调试：is_explicit_mention=%s, is_direct_reply_to_me=%s, contains_keyword=%s",
+                        is_explicit_mention,
+                        is_direct_reply_to_me,
+                        contains_keyword_mention,
+                    )
+
+                    pending_action = thread_state.get("pending_memory_action")
+                    pending_user = thread_state.get("pending_memory_user_id")
+                    if pending_action and (pending_user is None or pending_user == msg.user_id):
+                        if stripped_lower in ("yes", "y"):
+                            if pending_action == "clear_recent":
+                                thread_history = []
+                                save_thread_history(tid, thread_history)
+                                thread_state["last_summary_index"] = 0
+                                thread_state["total_messages_seen"] = 0
+                                thread_state["last_mention_id"] = None
+                                cl.direct_answer(tid, "Done. Recent memory cleared for this chat.")
+                            elif pending_action == "clear_all":
+                                delete_thread_history(tid)
+                                delete_thread_summaries(tid)
+                                thread_history = []
+                                thread_state["last_summary_index"] = 0
+                                thread_state["total_messages_seen"] = 0
+                                thread_state["last_mention_id"] = None
+                                cl.direct_answer(tid, "Done. All memory cleared for this chat.")
+                            thread_state["pending_memory_action"] = None
+                            thread_state["pending_memory_user_id"] = None
+                            state_dirty = True
+                            continue
+                        if stripped_lower in ("no", "n", "cancel"):
+                            cl.direct_answer(tid, "Cancelled. No memory was deleted.")
+                            thread_state["pending_memory_action"] = None
+                            thread_state["pending_memory_user_id"] = None
+                            state_dirty = True
+                            continue
+                        cl.direct_answer(tid, 'Please reply "yes" to confirm, or "no" to cancel.')
+                        continue
+
+                    config_trigger = False
+                    if is_private:
+                        config_trigger = "/config" in text_lower
+                    else:
+                        config_trigger = is_explicit_mention and "/config" in text_lower
+                    if config_trigger:
+                        thread_state["config_mode"] = True
+                        state_dirty = True
+                        cl.direct_answer(tid, CONFIG_MENU_TEXT)
+                        logging.info("调试：进入 config_mode, thread=%s", tid)
+                        continue
+
+                    if thread_state.get("config_mode"):
+                        if stripped_lower in ("/exit", "exit", "quit", "q"):
+                            thread_state["config_mode"] = False
+                            state_dirty = True
+                            cl.direct_answer(tid, "Config session closed. Back to normal mode.")
+                            logging.info("调试：退出 config_mode, thread=%s", tid)
+                            continue
+                        if handle_mode_command(text_raw, thread_state, tid, cl):
+                            state_dirty = True
+                            continue
+                        handled_mem, thread_history, dirty_mem = handle_mem_command(
+                            msg, thread_state, thread_history, tid, cl
+                        )
+                        if handled_mem:
+                            state_dirty = state_dirty or dirty_mem
+                            continue
+                        if handle_summary_command(msg, thread_history, tid, cl):
+                            continue
+                        if handle_maxlen_command(text_raw, thread_state, tid, cl):
+                            state_dirty = True
+                            continue
+                        if handle_temp_command(text_raw, thread_state, tid, cl):
+                            state_dirty = True
+                            continue
+                        continue
+
+                    is_mem_cmd = (is_private and text_lower.strip().startswith("/mem")) or (
+                        (not is_private) and is_explicit_mention and text_lower.strip().startswith("/mem")
+                    )
+                    if is_mem_cmd:
+                        handled_mem, thread_history, dirty_mem = handle_mem_command(
+                            msg, thread_state, thread_history, tid, cl
+                        )
+                        if handled_mem:
+                            state_dirty = state_dirty or dirty_mem
+                            continue
+
+                    is_summary_cmd = (is_private and text_lower.strip().startswith("/summary")) or (
+                        (not is_private) and is_explicit_mention and text_lower.strip().startswith("/summary")
+                    )
+                    if is_summary_cmd and handle_summary_command(msg, thread_history, tid, cl):
+                        continue
+
+                    is_mode_cmd = (is_private and text_lower.strip().startswith("/mode")) or (
+                        (not is_private) and is_explicit_mention and text_lower.strip().startswith("/mode")
+                    )
+                    if is_mode_cmd and handle_mode_command(text_raw, thread_state, tid, cl):
+                        state_dirty = True
+                        continue
+
+                    is_maxlen_cmd = (is_private and text_lower.strip().startswith("/maxlen")) or (
+                        (not is_private)
+                        and is_explicit_mention
+                        and text_lower.strip().startswith("/maxlen")
+                    )
+                    if is_maxlen_cmd and handle_maxlen_command(text_raw, thread_state, tid, cl):
+                        state_dirty = True
+                        continue
+
+                    is_temp_cmd = (is_private and text_lower.strip().startswith("/temp")) or (
+                        (not is_private) and is_explicit_mention and text_lower.strip().startswith("/temp")
+                    )
+                    if is_temp_cmd and handle_temp_command(text_raw, thread_state, tid, cl):
+                        state_dirty = True
+                        continue
+
+                    reply_mode = thread_state.get("reply_mode", "@andreply")
+                    if is_private:
+                        should_reply = reply_mode != "quiet"
+                    else:
+                        if reply_mode == "quiet":
+                            should_reply = False
+                        elif reply_mode == "@andreply":
+                            should_reply = is_explicit_mention or is_direct_reply_to_me
+                        elif reply_mode == "mention":
+                            should_reply = (
+                                is_explicit_mention
+                                or is_direct_reply_to_me
+                                or contains_keyword_mention
+                            )
+                        elif reply_mode == "all":
+                            should_reply = True
+                        else:
+                            should_reply = is_explicit_mention or is_direct_reply_to_me
+
+                    debug_override = False
+                    if DEBUG_IGNORE_MENTION and not thread_state.get("config_mode"):
+                        should_reply = True
+                        debug_override = True
+                    if not should_reply:
+                        continue
+
+                    target_msg = msg
+                    focus_id_for_context = last_focus_id if not is_private else None
+                    if debug_override:
+                        logging.info(
+                            "DEBUG_IGNORE_MENTION 生效，强制回复 thread=%s, msg_id=%s", tid, msg.id
+                        )
+
                 last_summary_index = _safe_int(thread_state.get("last_summary_index"), 0)
                 if last_summary_index > len(thread_history):
                     last_summary_index = len(thread_history)
+                    thread_state["last_summary_index"] = last_summary_index
+                    state_dirty = True
                 while len(thread_history) - last_summary_index >= SUMMARY_BATCH_SIZE:
                     batch = thread_history[
                         last_summary_index : last_summary_index + SUMMARY_BATCH_SIZE
@@ -1127,17 +1607,6 @@ def main_loop() -> None:
                             is_dm=True,
                         )
 
-                target_msg: DirectMessage | None = None
-                focus_id_for_context = None
-                if DEBUG_IGNORE_MENTION:
-                    target_msg = reply_candidate
-                    focus_id_for_context = last_focus_id if not is_private else None
-                elif is_private:
-                    target_msg = reply_candidate
-                elif mention_msgs:
-                    target_msg = mention_msgs[-1]
-                    focus_id_for_context = last_focus_id
-
                 if target_msg:
                     if enable_seen and not is_private and target_msg.user_id != my_pk:
                         mark_message_seen(
@@ -1148,21 +1617,29 @@ def main_loop() -> None:
                             is_dm=False,
                         )
 
+                    fish_mode_enabled = bool(thread_state.get("fish_mode"))
+                    long_memory_enabled = bool(thread_state.get("long_memory_enabled", True)) and not fish_mode_enabled
                     context = build_context_with_memory(
-                        tid, thread_history, focus_id_for_context
+                        tid,
+                        thread_history,
+                        focus_id_for_context,
+                        fish_mode=fish_mode_enabled,
+                        long_memory_enabled=long_memory_enabled,
                     )
                     logging.info(
-                        "构造上下文完成，长度=%d, target_msg=%s, mention_count=%d",
+                        "构造上下文完成，长度=%d, target_msg=%s",
                         len(context),
                         target_msg.id,
-                        len(mention_msgs),
                     )
-                    # 随机等待，模拟“思考中”，降低触发风控概率
                     send_typing_indicator(cl, tid)
                     time.sleep(random.uniform(1.0, 2.0))
 
                     try:
-                        reply = ask_qwen(context)
+                        temperature = float(thread_state.get("temperature", 0.5))
+                        max_tokens = int(thread_state.get("max_reply_len", 256))
+                        reply = ask_qwen(
+                            context, temperature=temperature, max_tokens=max_tokens
+                        )
                     except Exception as exc:
                         logging.error("调用 Qwen 出错，使用兜底文案：%s", exc)
                         reply = "我刚刚有点卡顿，可以再说一遍吗？"
@@ -1174,10 +1651,9 @@ def main_loop() -> None:
                         reply[:100],
                     )
                     cl.direct_answer(tid, reply)
-                    if not is_private:
-                        if mention_msgs:
-                            thread_state["last_mention_id"] = mention_msgs[-1].id
-                            state_dirty = True
+                    if not is_private and target_msg:
+                        thread_state["last_mention_id"] = target_msg.id
+                        state_dirty = True
 
             if state_dirty:
                 save_state(state)
@@ -1187,7 +1663,12 @@ def main_loop() -> None:
                 last_activity_ts = now
 
             idle = (now - last_activity_ts) > 20 * 60
-            if idle:
+            any_config_active = any(
+                isinstance(ts, dict) and ts.get("config_mode") for ts in state.values()
+            )
+            if any_config_active:
+                sleep_sec = 1.0
+            elif idle:
                 sleep_sec = random.uniform(30, 90)
             else:
                 sleep_sec = 2 + random.uniform(1, 10)
@@ -1201,7 +1682,6 @@ def main_loop() -> None:
             time.sleep(sleep_sec)
 
         except Exception as exc:
-            # 捕获主循环异常，避免直接退出
             logging.error("主循环异常：%s", exc, exc_info=True)
             time.sleep(60)
 
