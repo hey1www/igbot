@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py ./bot.py
 COPY login_test.py ./login_test.py
 COPY list_threads.py ./list_threads.py
+COPY prompts ./prompts
 
 # 确保数据目录存在（实际运行时会被 volume 覆盖）
 RUN mkdir -p /app/data

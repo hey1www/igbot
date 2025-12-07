@@ -1614,7 +1614,7 @@ def main_loop() -> None:
                 sleep_sec = 1.0
             else:
                 if idle:
-                    sleep_sec = random.uniform(30, 90)
+                    sleep_sec = random.uniform(60, 180)
                 else:
                     sleep_sec = 2 + random.uniform(1, 10)
 
